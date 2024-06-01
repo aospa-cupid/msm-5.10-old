@@ -783,7 +783,7 @@ static void nohz_csd_func(void *info)
 	/*
 	 * Release the rq::nohz_csd.
 	 */
-	flags = atomic_fetch_andnot(NOHZ_KICK_MASK | NOHZ_NEWILB_KICK, nohz_flags(cpu));
+	flags = atomic_fetch_andnot(NOHZ_KICK_MASK, nohz_flags(cpu));
 	WARN_ON(!(flags & NOHZ_KICK_MASK));
 
 	rq->idle_balance = idle_cpu(cpu);
@@ -3122,43 +3122,38 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	 * A similar smb_rmb() lives in try_invoke_on_locked_down_task().
 	 */
 	smp_rmb();
-	if (READ_ONCE(p->on_rq)) {
-		if (ttwu_runnable(p, wake_flags))
-			goto unlock;
-	} else {
-#ifdef CONFIG_SMP
-		/*
-		 * Ensure we load p->on_cpu _after_ p->on_rq, otherwise it would
-		 * be possible to, falsely, observe p->on_cpu == 0.
-		 *
-		 * One must be running (->on_cpu == 1) in order to remove
-		 * oneself from the runqueue.
-		 *
-		 * __schedule() (switch to task 'p')	try_to_wake_up()
-		 *   STORE p->on_cpu = 1		  LOAD p->on_rq
-		 *   UNLOCK rq->lock
-		 *
-		 * __schedule() (put 'p' to sleep)
-		 *   LOCK rq->lock			  smp_rmb();
-		 *   smp_mb__after_spinlock();
-		 *   STORE p->on_rq = 0			  LOAD p->on_cpu
-		 *
-		 * Pairs with the LOCK+smp_mb__after_spinlock() on rq->lock in
-		 * __schedule().  See the comment for smp_mb__after_spinlock().
-		 *
-		 * Form a control-dep-acquire with p->on_rq == 0 above, to
-		 * ensure schedule()'s deactivate_task() has 'happened' and p
-		 * will no longer care about it's own p->state. See the comment
-		 * in __schedule().
-		 */
-		smp_acquire__after_ctrl_dep();
-#endif
-	}
+	if (READ_ONCE(p->on_rq) && ttwu_runnable(p, wake_flags))
+		goto unlock;
 
 	if (p->state & TASK_UNINTERRUPTIBLE)
 		trace_sched_blocked_reason(p);
 
 #ifdef CONFIG_SMP
+	/*
+	 * Ensure we load p->on_cpu _after_ p->on_rq, otherwise it would be
+	 * possible to, falsely, observe p->on_cpu == 0.
+	 *
+	 * One must be running (->on_cpu == 1) in order to remove oneself
+	 * from the runqueue.
+	 *
+	 * __schedule() (switch to task 'p')	try_to_wake_up()
+	 *   STORE p->on_cpu = 1		  LOAD p->on_rq
+	 *   UNLOCK rq->lock
+	 *
+	 * __schedule() (put 'p' to sleep)
+	 *   LOCK rq->lock			  smp_rmb();
+	 *   smp_mb__after_spinlock();
+	 *   STORE p->on_rq = 0			  LOAD p->on_cpu
+	 *
+	 * Pairs with the LOCK+smp_mb__after_spinlock() on rq->lock in
+	 * __schedule().  See the comment for smp_mb__after_spinlock().
+	 *
+	 * Form a control-dep-acquire with p->on_rq == 0 above, to ensure
+	 * schedule()'s deactivate_task() has 'happened' and p will no longer
+	 * care about it's own p->state. See the comment in __schedule().
+	 */
+	smp_acquire__after_ctrl_dep();
+
 	/*
 	 * We're doing the wakeup (@success == 1), they did a dequeue (p->on_rq
 	 * == 0), which means we need to do an enqueue, change p->state to
@@ -4027,6 +4022,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
 		 * finish_task_switch()'s mmdrop().
 		 */
 		switch_mm_irqs_off(prev->active_mm, next->mm, next);
+		lru_gen_use_mm(next->mm);
 
 		if (!prev->mm) {                        // from kernel
 			/* will mmdrop() in finish_task_switch(). */
@@ -7853,22 +7849,6 @@ static void sched_free_group(struct task_group *tg)
 	kmem_cache_free(task_group_cache, tg);
 }
 
-static void sched_free_group_rcu(struct rcu_head *rcu)
-{
-	sched_free_group(container_of(rcu, struct task_group, rcu));
-}
-
-static void sched_unregister_group(struct task_group *tg)
-{
-	unregister_fair_sched_group(tg);
-	unregister_rt_sched_group(tg);
-	/*
-	 * We have to wait for yet another RCU grace period to expire, as
-	 * print_cfs_stats() might run concurrently.
-	 */
-	call_rcu(&tg->rcu, sched_free_group_rcu);
-}
-
 /* allocate runqueue etc for a new task group */
 struct task_group *sched_create_group(struct task_group *parent)
 {
@@ -7912,35 +7892,25 @@ void sched_online_group(struct task_group *tg, struct task_group *parent)
 }
 
 /* rcu callback to free various structures associated with a task group */
-static void sched_unregister_group_rcu(struct rcu_head *rhp)
+static void sched_free_group_rcu(struct rcu_head *rhp)
 {
 	/* Now it should be safe to free those cfs_rqs: */
-	sched_unregister_group(container_of(rhp, struct task_group, rcu));
+	sched_free_group(container_of(rhp, struct task_group, rcu));
 }
 
 void sched_destroy_group(struct task_group *tg)
 {
 	/* Wait for possible concurrent references to cfs_rqs complete: */
-	call_rcu(&tg->rcu, sched_unregister_group_rcu);
+	call_rcu(&tg->rcu, sched_free_group_rcu);
 }
 
-void sched_release_group(struct task_group *tg)
+void sched_offline_group(struct task_group *tg)
 {
 	unsigned long flags;
 
-	/*
-	 * Unlink first, to avoid walk_tg_tree_from() from finding us (via
-	 * sched_cfs_period_timer()).
-	 *
-	 * For this to be effective, we have to wait for all pending users of
-	 * this task group to leave their RCU critical section to ensure no new
-	 * user will see our dying task group any more. Specifically ensure
-	 * that tg_unthrottle_up() won't add decayed cfs_rq's to it.
-	 *
-	 * We therefore defer calling unregister_fair_sched_group() to
-	 * sched_unregister_group() which is guarantied to get called only after the
-	 * current RCU grace period has expired.
-	 */
+	/* End participation in shares distribution: */
+	unregister_fair_sched_group(tg);
+
 	spin_lock_irqsave(&task_group_lock, flags);
 	list_del_rcu(&tg->list);
 	list_del_rcu(&tg->siblings);
@@ -8060,7 +8030,7 @@ static void cpu_cgroup_css_released(struct cgroup_subsys_state *css)
 {
 	struct task_group *tg = css_tg(css);
 
-	sched_release_group(tg);
+	sched_offline_group(tg);
 }
 
 static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
@@ -8070,7 +8040,7 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
 	/*
 	 * Relies on the RCU grace period between css_released() and this.
 	 */
-	sched_unregister_group(tg);
+	sched_free_group(tg);
 }
 
 /*
