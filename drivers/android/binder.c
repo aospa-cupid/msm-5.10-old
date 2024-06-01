@@ -1810,10 +1810,8 @@ static size_t binder_get_object(struct binder_proc *proc,
 	size_t object_size = 0;
 
 	read_size = min_t(size_t, sizeof(*object), buffer->data_size - offset);
-	if (offset > buffer->data_size || read_size < sizeof(*hdr) ||
-	    !IS_ALIGNED(offset, sizeof(u32)))
+	if (offset > buffer->data_size || read_size < sizeof(*hdr))
 		return 0;
-
 	if (u) {
 		if (copy_from_user(object, u + offset, read_size))
 			return 0;
@@ -3336,7 +3334,7 @@ static void binder_transaction(struct binder_proc *proc,
 
 	t->buffer = binder_alloc_new_buf(&target_proc->alloc, tr->data_size,
 		tr->offsets_size, extra_buffers_size,
-		!reply && (t->flags & TF_ONE_WAY), current->tgid);
+		!reply && (t->flags & TF_ONE_WAY));
 	if (IS_ERR(t->buffer)) {
 		/*
 		 * -ESRCH indicates VMA cleared. The target is dying.
@@ -4994,7 +4992,7 @@ static void binder_free_proc(struct binder_proc *proc)
 {
 	struct binder_device *device;
 	struct binder_proc_ext *eproc =
-		container_of(proc, struct binder_proc_ext, proc);
+		binder_proc_ext_entry(proc);
 
 	BUG_ON(!list_empty(&proc->todo));
 	BUG_ON(!list_empty(&proc->delivered_death));
@@ -6075,9 +6073,9 @@ static void print_binder_transaction_ilocked(struct seq_file *m,
 	}
 	if (buffer->target_node)
 		seq_printf(m, " node %d", buffer->target_node->debug_id);
-	seq_printf(m, " size %zd:%zd data %pK\n",
+	seq_printf(m, " size %zd:%zd offset %lx\n",
 		   buffer->data_size, buffer->offsets_size,
-		   buffer->user_data);
+		   proc->alloc.buffer - buffer->user_data);
 }
 
 static void print_binder_work_ilocked(struct seq_file *m,
