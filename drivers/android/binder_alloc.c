@@ -463,9 +463,6 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 	unsigned long curr_last_page;
 	size_t buffer_size;
 
-	/* Pad 0-size buffers so they get assigned unique addresses */
-	size = max(size, sizeof(void *));
-
 	trace_android_vh_binder_alloc_new_buf_locked(size, alloc, is_async);
 
 	if (is_async && alloc->free_async_space < size) {
